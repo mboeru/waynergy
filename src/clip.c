@@ -1,13 +1,17 @@
 #include "clip.h"
 #include "wayland.h"
 #include "net.h"
+#include "config.h"
+#include "clip-bitmap.h"
 
 extern uSynergyContext synContext;
 extern char **environ;
 
 int clipMonitorFd;
 struct sockaddr_un clipMonitorAddr;
-pid_t clipMonitorPid[2];
+pid_t clipMonitorPid[CLIP_MONITOR_COUNT];
+static uint64_t remoteBitmapHash[2];
+static bool haveRemoteBitmap[2];
 
 /* check for wl-clipboard's presence */
 bool clipHaveWlClipboard(void)
@@ -59,7 +63,7 @@ bool clipSetupSockets()
 	free(path);
 	unlink(clipMonitorAddr.sun_path);
 	clipMonitorAddr.sun_family = AF_UNIX;
-	if ((clipMonitorFd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+	if ((clipMonitorFd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1) {
 		logPErr("socket");
 		return false;
 	}
@@ -77,44 +81,38 @@ bool clipSetupSockets()
 	return true;
 }
 
-/* spawn wl-paste watchers */
+/* Spawn separate text and image watchers for both selections. */
 bool clipSpawnMonitors(void)
 {
-	char *argv_0[] = {
-			"wl-paste",
-			"-n",
-			"--type",
-			"text",
-			"-w",
-			"waynergy-clip-update",
-			"c",
-			clipMonitorAddr.sun_path,
-			NULL
-	};
-	char *argv_1[] = {
-			"wl-paste",
-			"-n",
-			"--type",
-			"text",
-			"--primary",
-			"-w",
-			"waynergy-clip-update",
-			"p",
-			clipMonitorAddr.sun_path,
-			NULL
-	};
-	char **argv[] = { argv_0, argv_1 };
-	/* kill the other crap on our socket */
-	char *killcmd;
-	int killret;
-	xasprintf(&killcmd, "pkill -f 'wlpaste.*%s'", clipMonitorAddr.sun_path);
-	if ((killret = system(killcmd))) {
-		logWarn("Could not kill lingering wlpaste instances: %d\n", killret);
+	/* Always use the companion helper from the same installation. */
+	char *helper = "waynergy-clip-update";
+#ifdef __linux__
+	char helper_path[PATH_MAX];
+	ssize_t pathlen = readlink("/proc/self/exe", helper_path, sizeof(helper_path) - 1);
+	if (pathlen >= 0 && (size_t)pathlen < sizeof(helper_path) - 1) {
+		helper_path[pathlen] = '\0';
+		char *basename = strrchr(helper_path, '/');
+		if (basename && sizeof(helper_path) - (basename + 1 - helper_path) >= sizeof("waynergy-clip-update")) {
+			strcpy(basename + 1, "waynergy-clip-update");
+			if (!access(helper_path, X_OK))
+				helper = helper_path;
+		}
 	}
-	free(killcmd);
-	for (int i = 0; i < 2; ++i) {
-		if (posix_spawnp(clipMonitorPid + i,"wl-paste",NULL,NULL,argv[i],environ)) {
-			logPErr("spawn");
+#endif
+	char *text[] = {"wl-paste", "-n", "--type", "text", "-w",
+		helper, "c", clipMonitorAddr.sun_path, NULL};
+	char *primary_text[] = {"wl-paste", "-n", "--type", "text", "--primary", "-w",
+		helper, "p", clipMonitorAddr.sun_path, NULL};
+	char *image[] = {"wl-paste", "-n", "--type", "image", "-w",
+		helper, "c", clipMonitorAddr.sun_path, "bitmap", NULL};
+	char *primary_image[] = {"wl-paste", "-n", "--type", "image", "--primary", "-w",
+		helper, "p", clipMonitorAddr.sun_path, "bitmap", NULL};
+	char **argv[] = {text, primary_text, image, primary_image};
+	for (int i = 0; i < CLIP_MONITOR_COUNT; ++i) {
+		int error = posix_spawnp(clipMonitorPid + i, "wl-paste", NULL, NULL, argv[i], environ);
+		if (error) {
+			errno = error;
+			logPErr("spawn clipboard watcher");
 			return false;
 		}
 	}
@@ -132,7 +130,7 @@ void clipMonitorPollProc(struct pollfd *pfd)
 			for (int i = POLLFD_CLIP_UPDATER; i < POLLFD_COUNT; ++i) {
 				if (netPollFd[i].fd == -1) {
 					logDbg("Accepting");
-					netPollFd[i].fd = accept(clipMonitorFd, NULL, NULL);
+					netPollFd[i].fd = accept4(clipMonitorFd, NULL, NULL, SOCK_CLOEXEC);
 					if (netPollFd[i].fd == -1) {
 						logPErr("accept");
 						switch (errno) {
@@ -160,25 +158,49 @@ void clipMonitorPollProc(struct pollfd *pfd)
 				logPErr("Could not read clipboard data length");
 				goto done;
 			}
-			/* --type text produces empty events for non-text selections.
-			 * Do not grab the shared clipboard for these image notifications. */
 			if (len == 0)
 				goto done;
+			if (len > USYNERGY_MAX_CLIPBOARD_SIZE - 12) {
+				logWarn("Rejecting oversized local clipboard: %zu bytes", len);
+				goto done;
+			}
 			buf = xmalloc(len);
 			if (!read_full(pfd->fd, buf, len, 0)) {
 				logPErr("Could not read clipboard data");
 				goto done;
 			}
-			if (c_id == 'p') {
+			if (c_id == 'p' || c_id == 'P') {
 				id = SYNERGY_CLIPBOARD_SELECTION;
-			} else if (c_id == 'c') {
+			} else if (c_id == 'c' || c_id == 'C') {
 				id = SYNERGY_CLIPBOARD_CLIPBOARD;
 			} else {
 				logErr("Unknown clipboard ID %c", c_id);
 				goto done;
 			}
 			logDbg("Clipboard data read for %c: %zd bytes", c_id, len);
-			uSynergyUpdateClipBuf(&synContext, id , len, buf);
+			if (c_id == 'C' || c_id == 'P') {
+				uint64_t hash;
+				if (!clipBitmapHash((unsigned char *)buf, len, &hash)) {
+					logWarn("Rejecting malformed local bitmap");
+					goto done;
+				}
+				if (haveRemoteBitmap[id] && hash == remoteBitmapHash[id]) {
+					logDbg("Ignoring image echoed from remote clipboard");
+					goto done;
+				}
+				/* Barrier, Deskflow and modern Synergy use bitmap slot 2. */
+				long format = configTryLong("clipboard/bitmap_format", 2);
+				if (format != 1 && format != 2) {
+					logWarn("Invalid clipboard/bitmap_format; using 2");
+					format = 2;
+				}
+				haveRemoteBitmap[id] = false;
+				uSynergyUpdateClipBufFormat(&synContext, id, format, len, (unsigned char *)buf);
+				logInfo("Queued local image for remote clipboard: %zu bytes, format %ld", len, format);
+			} else {
+				haveRemoteBitmap[id] = false;
+				uSynergyUpdateClipBuf(&synContext, id, len, buf);
+			}
 done:
 			shutdown(pfd->fd, SHUT_RDWR);
 			close(pfd->fd);
@@ -231,6 +253,7 @@ bool clipWlCopy(enum uSynergyClipboardId id, const unsigned char *data, size_t l
 	/* write to child process */
 	write_full(fd[1], data, len, 0);
 	close(fd[1]);
+	haveRemoteBitmap[id] = false;
 	return true;
 }
 
@@ -317,6 +340,8 @@ bool clipWlCopyBitmap(enum uSynergyClipboardId id, const unsigned char *data, si
 		        len, width, height, bits_per_pixel);
 		return false;
 	}
+
+	haveRemoteBitmap[id] = clipBitmapHash(data, len, &remoteBitmapHash[id]);
 
 	/* macOS can provide a BITMAPV5HEADER, but Synergy's wire converter keeps
 	 * only the first 40 bytes while leaving biSize set to 124. In that case

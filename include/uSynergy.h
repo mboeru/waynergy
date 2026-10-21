@@ -422,8 +422,8 @@ extern void		uSynergyUpdate(uSynergyContext *context);
 This function sets new clipboard data and prepares it to be sent to the server
 on screen deactivation. 
 
-Currently there is only support for plaintext, but HTML and image data could be
-supported with some effort.
+The original entry point sends plain text. The format-aware entry point also
+accepts bitmap DIB data; its format ID must match the remote implementation.
 
 @param context		Context to send clipboard data to
 @param id 		Clipboard to send data to
@@ -431,6 +431,8 @@ supported with some effort.
 @param text		Text to set to the clipboard
 **/
 extern void 		uSynergyUpdateClipBuf(uSynergyContext *context, enum uSynergyClipboardId id, uint32_t len, const char *data);
+extern void uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboardId id,
+	uint32_t format, uint32_t len, const unsigned char *data);
 
 /**
 @brief Update screen resolution

@@ -886,34 +886,25 @@ void uSynergyUpdate(uSynergyContext *context)
 
 
 
-/* check all formats in the clipboard message buffer */
-static bool uSynergyClipBufContains(uSynergyContext *context, enum uSynergyClipboardId id, uint32_t len, const char *data)
+/* Check format and bounds as well as data when suppressing clipboard echoes. */
+static bool uSynergyClipBufContains(uSynergyContext *context, enum uSynergyClipboardId id,
+	uint32_t format, uint32_t len, const unsigned char *data)
 {
-	uint32_t formats, flen;
+	uint32_t formats, current_format, flen;
 	struct sspBuf buf = {
 		.data = context->m_clipBuf[id],
-		.pos = 0,
-		.len = context->m_clipLen[id]
+		.len = context->m_clipPos[id]
 	};
-	if (!buf.data)
+	if (!buf.data || context->m_clipInStream[id] || !sspNetU32(&buf, &formats))
 		return false;
-	if (context->m_clipInStream[id])
-		return false;
-	if (!sspNetU32(&buf, &formats)) {
-		logErr("Clipboard parse error: %d, %d", buf.pos, buf.len);
-		return false;
-	}
-	for (int i = 0; i < formats; ++i) {
-		//skip the format, only check the raw data
-		if (!(sspNetU32(&buf, NULL) && sspNetU32(&buf, &flen))) {
-			logErr("Clipboard format parse error");
+	for (uint32_t i = 0; i < formats; ++i) {
+		if (!sspNetU32(&buf, &current_format) || !sspNetU32(&buf, &flen) ||
+			flen > buf.len - buf.pos)
 			return false;
-		}
-		if (flen == len) {
-			if (!memcmp(data, buf.data + buf.pos, len)) {
-				return true;
-			}
-		}
+		if (current_format == format && flen == len && !memcmp(data, buf.data + buf.pos, len))
+			return true;
+		if (!sspSeek(&buf, flen))
+			return false;
 	}
 	return false;
 }
@@ -927,34 +918,48 @@ static uint8_t *buf_add_int32(uint8_t *buf, uint32_t val)
 	buf[3] = val & 0xFF;
 	return buf + 4;
 }
-/* Update clipboard buffer from local clipboard */
+/* Preserve the plain-text API for existing callers. */
 void uSynergyUpdateClipBuf(uSynergyContext *context, enum uSynergyClipboardId id, uint32_t len, const char *data)
 {
-	/* to prevent feedback loops, check to make sure the data is actually
-	 * different from what we've already got */
-	if (uSynergyClipBufContains(context, id, len, data))
+	uSynergyUpdateClipBufFormat(context, id, USYNERGY_CLIPBOARD_FORMAT_TEXT, len,
+		(const unsigned char *)data);
+}
+
+/* Update clipboard buffer from local text or bitmap data. */
+void uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboardId id,
+	uint32_t format, uint32_t len, const unsigned char *data)
+{
+	if ((id != SYNERGY_CLIPBOARD_CLIPBOARD && id != SYNERGY_CLIPBOARD_SELECTION) ||
+		!data || len > USYNERGY_MAX_CLIPBOARD_SIZE - 12)
 		return;
-	/* grab the clipboard, initialize the buffer */
+	if (uSynergyClipBufContains(context, id, format, len, data))
+		return;
 	context->m_clipInStream[id] = false;
 	context->m_clipGrabbed[id] = true;
-	context->m_clipPos[id] = len + 4 + 4 + 4; //format count, format ID, size, data
+	context->m_clipPos[id] = (size_t)len + 12;
 	if (context->m_clipLen[id] < context->m_clipPos[id]) {
 		context->m_clipLen[id] = context->m_clipPos[id];
 		context->m_clipBuf[id] = xrealloc(context->m_clipBuf[id], context->m_clipLen[id]);
 	}
-	/*populate buffer*/
 	uint8_t *buf = context->m_clipBuf[id];
-	buf = buf_add_int32(buf, 1); //formats
-	buf = buf_add_int32(buf, USYNERGY_CLIPBOARD_FORMAT_TEXT); //type, text only for now
-	buf = buf_add_int32(buf, len); //length of actual data
+	buf = buf_add_int32(buf, 1);
+	buf = buf_add_int32(buf, format);
+	buf = buf_add_int32(buf, len);
 	memmove(buf, data, len);
-	/* send CCLP  -- CCLP%1i%4i */
+	if (!context->m_connected || !context->m_hasReceivedHello)
+		return;
 	if (!(sAddString(context, "CCLP") &&
-	      sAddUInt8(context, id) &&
-	      sAddUInt32(context, context->m_sequenceNumber))) {
+		  sAddUInt8(context, id) &&
+		  sAddUInt32(context, context->m_sequenceNumber))) {
 		REPLY_ERROR();
 	}
 	sSendReply(context);
+	/* Conversion may finish just after COUT. Do not wait for another screen
+	 * transition to send that image to the now-active server. */
+	if (!context->m_isCaptured) {
+		uSynergySendClipboard(context, id, context->m_clipPos[id], context->m_clipBuf[id]);
+		context->m_clipGrabbed[id] = false;
+	}
 }
 
 /* Update resolution */

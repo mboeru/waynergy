@@ -20,9 +20,10 @@
 
 
 #define CLIP_UPDATER_FD_COUNT 8
+#define CLIP_MONITOR_COUNT 4
 extern int clipMonitorFd;
 extern struct sockaddr_un clipMonitorAddr;
-extern pid_t clipMonitorPid[2];
+extern pid_t clipMonitorPid[CLIP_MONITOR_COUNT];
 
 /* check if wl-clipboard is even present */
 bool clipHaveWlClipboard(void);

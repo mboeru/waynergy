@@ -17,7 +17,7 @@ static char **argv_reexec;
 static void cleanup(enum sigExitStatus status)
 {
 	/* stop clipboard monitors */
-	for (int i = 0; i < 2; ++i) {
+	for (int i = 0; i < CLIP_MONITOR_COUNT; ++i) {
 		if (clipMonitorPid[i] > 0) {
 			kill(clipMonitorPid[i], SIGTERM);
 		}
