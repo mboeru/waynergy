@@ -76,9 +76,12 @@ static void hash_tests(void)
 	assert(clipBitmapHash(b, sizeof(b), &bh) && ah == bh);
 	b[40]++;
 	assert(clipBitmapHash(b, sizeof(b), &bh) && ah != bh);
-	a[0] = 124; /* Truncated macOS V5 header. */
-	assert(clipBitmapHash(a, sizeof(a), &bh) && ah == bh);
-	assert(!clipBitmapHash(a, sizeof(a) - 1, &bh));
+	b[40]--;
+	b[0] = 124; b[16] = 3; /* Exact legacy V5 header + BGRA payload. */
+	assert(clipBitmapHash(b, sizeof(b), &bh) && ah == bh);
+	assert(!clipBitmapHash(b, sizeof(b) - 1, &bh));
+	b[0] = 108; /* Do not repair arbitrary truncated extended headers. */
+	assert(!clipBitmapHash(b, sizeof(b), &bh));
 	a[4] = 255; a[7] = 127;
 	assert(!clipBitmapHash(a, sizeof(a), &bh));
 }

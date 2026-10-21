@@ -12,6 +12,29 @@ struct sockaddr_un clipMonitorAddr;
 pid_t clipMonitorPid[CLIP_MONITOR_COUNT];
 static uint64_t remoteBitmapHash[2];
 static bool haveRemoteBitmap[2];
+static bool clipImagesEnabled;
+
+static bool clipHaveImageConverter(void)
+{
+	int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+	if (null_fd < 0)
+		return false;
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, null_fd, STDOUT_FILENO);
+	posix_spawn_file_actions_adddup2(&actions, null_fd, STDERR_FILENO);
+	char *args[] = {"magick", "-version", NULL};
+	pid_t pid;
+	int status = -1;
+	sigWaitSIGCHLD(true);
+	int error = posix_spawnp(&pid, "magick", &actions, NULL, args, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	close(null_fd);
+	if (!error)
+		while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+	sigWaitSIGCHLD(false);
+	return !error && status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
 
 /* check for wl-clipboard's presence */
 bool clipHaveWlClipboard(void)
@@ -84,6 +107,11 @@ bool clipSetupSockets()
 /* Spawn separate text and image watchers for both selections. */
 bool clipSpawnMonitors(void)
 {
+	clipImagesEnabled = configTryBool("clipboard/images", true);
+	if (clipImagesEnabled && !clipHaveImageConverter()) {
+		logWarn("ImageMagick unavailable; synchronizing text clipboards only");
+		clipImagesEnabled = false;
+	}
 	/* Always use the companion helper from the same installation. */
 	char *helper = "waynergy-clip-update";
 #ifdef __linux__
@@ -100,15 +128,15 @@ bool clipSpawnMonitors(void)
 	}
 #endif
 	char *text[] = {"wl-paste", "-n", "--type", "text", "-w",
-		helper, "c", clipMonitorAddr.sun_path, NULL};
+		helper, "c", clipMonitorAddr.sun_path, clipImagesEnabled ? NULL : "text-only", NULL};
 	char *primary_text[] = {"wl-paste", "-n", "--type", "text", "--primary", "-w",
-		helper, "p", clipMonitorAddr.sun_path, NULL};
+		helper, "p", clipMonitorAddr.sun_path, clipImagesEnabled ? NULL : "text-only", NULL};
 	char *image[] = {"wl-paste", "-n", "--type", "image", "-w",
 		helper, "c", clipMonitorAddr.sun_path, "bitmap", NULL};
 	char *primary_image[] = {"wl-paste", "-n", "--type", "image", "--primary", "-w",
 		helper, "p", clipMonitorAddr.sun_path, "bitmap", NULL};
 	char **argv[] = {text, primary_text, image, primary_image};
-	for (int i = 0; i < CLIP_MONITOR_COUNT; ++i) {
+	for (int i = 0; i < (clipImagesEnabled ? CLIP_MONITOR_COUNT : 2); ++i) {
 		int error = posix_spawnp(clipMonitorPid + i, "wl-paste", NULL, NULL, argv[i], environ);
 		if (error) {
 			errno = error;
@@ -257,44 +285,13 @@ bool clipWlCopy(enum uSynergyClipboardId id, const unsigned char *data, size_t l
 	return true;
 }
 
-static uint16_t clipReadLe16(const unsigned char *data)
-{
-	return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
-
-static uint32_t clipReadLe32(const unsigned char *data)
-{
-	return (uint32_t)data[0] |
-	       ((uint32_t)data[1] << 8) |
-	       ((uint32_t)data[2] << 16) |
-	       ((uint32_t)data[3] << 24);
-}
-
-static void clipWriteLe32(unsigned char *data, uint32_t value)
-{
-	data[0] = value & 0xff;
-	data[1] = (value >> 8) & 0xff;
-	data[2] = (value >> 16) & 0xff;
-	data[3] = value >> 24;
-}
-
-/*
- * Synergy's bitmap wire format is a Windows DIB: a 40-byte
- * BITMAPINFOHEADER followed immediately by 24- or 32-bit BI_RGB pixels. It
- * is a BMP file with the 14-byte BITMAPFILEHEADER omitted. ImageMagick
- * normalizes that BMP to PNG so Wayland applications get the MIME type they
- * most consistently support for pasted images.
- */
+/* Normalize all supported DIB layouts through the shared parser before
+ * converting to the image/png offer expected by Wayland applications. */
 bool clipWlCopyBitmap(enum uSynergyClipboardId id, const unsigned char *data, size_t len)
 {
-	static const size_t bmp_header_len = 14;
-	unsigned char bmp_header[14] = {0};
-	unsigned char normalized_dib_header[40];
-	uint32_t dib_size, compression;
-	int32_t width, height;
-	uint16_t planes, bits_per_pixel;
-	uint64_t abs_height, row_bits, row_bytes, pixel_bytes;
-	bool normalize_truncated_v5 = false;
+	unsigned char *bmp = NULL;
+	size_t bmp_len;
+	struct clipBitmap bitmap;
 	int bmp_pipe[2] = {-1, -1};
 	int png_pipe[2] = {-1, -1};
 	posix_spawn_file_actions_t magick_actions, copy_actions;
@@ -311,55 +308,13 @@ bool clipWlCopyBitmap(enum uSynergyClipboardId id, const unsigned char *data, si
 		logErr("Invalid clipboard ID for bitmap: %d", id);
 		return false;
 	}
-	if (len < 40 || len > UINT32_MAX - bmp_header_len) {
-		logWarn("Rejecting Synergy bitmap with invalid size: %zu bytes", len);
+	if (!clipImagesEnabled)
+		return false;
+	if (len > USYNERGY_MAX_CLIPBOARD_SIZE ||
+	    !clipBitmapParse(data, len, &bitmap) || !clipBitmapToBmp(data, len, &bmp, &bmp_len)) {
+		logWarn("Rejecting unsupported or malformed clipboard bitmap (%zu bytes)", len);
 		return false;
 	}
-
-	dib_size = clipReadLe32(data);
-	width = (int32_t)clipReadLe32(data + 4);
-	height = (int32_t)clipReadLe32(data + 8);
-	planes = clipReadLe16(data + 12);
-	bits_per_pixel = clipReadLe16(data + 14);
-	compression = clipReadLe32(data + 16);
-
-	if ((dib_size != 40 && dib_size != 108 && dib_size != 124) || dib_size > len ||
-	    width <= 0 || height == 0 || height == INT32_MIN || planes != 1 ||
-	    (bits_per_pixel != 24 && bits_per_pixel != 32) ||
-	    (compression != 0 && compression != 3)) {
-		logWarn("Rejecting unsupported Synergy bitmap: header=%u width=%d height=%d planes=%u bpp=%u compression=%u",
-		        dib_size, width, height, planes, bits_per_pixel, compression);
-		return false;
-	}
-	abs_height = height < 0 ? (uint64_t)(-(int64_t)height) : (uint64_t)height;
-	row_bits = (uint64_t)(uint32_t)width * bits_per_pixel;
-	row_bytes = ((row_bits + 31) / 32) * 4;
-	pixel_bytes = row_bytes * abs_height;
-	if (pixel_bytes > SIZE_MAX - 40 || len < 40 + (size_t)pixel_bytes) {
-		logWarn("Rejecting truncated Synergy bitmap: %zu bytes for %dx%d@%u",
-		        len, width, height, bits_per_pixel);
-		return false;
-	}
-
-	haveRemoteBitmap[id] = clipBitmapHash(data, len, &remoteBitmapHash[id]);
-
-	/* macOS can provide a BITMAPV5HEADER, but Synergy's wire converter keeps
-	 * only the first 40 bytes while leaving biSize set to 124. In that case
-	 * the pixel array starts at byte 40. Normalize it to a BI_RGB info header;
-	 * the received 32-bit pixels are already in the required BGRA order. */
-	if (dib_size > 40 && len < dib_size + pixel_bytes) {
-		memcpy(normalized_dib_header, data, sizeof(normalized_dib_header));
-		clipWriteLe32(normalized_dib_header, 40);
-		clipWriteLe32(normalized_dib_header + 16, 0);
-		dib_size = 40;
-		compression = 0;
-		normalize_truncated_v5 = true;
-	}
-
-	bmp_header[0] = 'B';
-	bmp_header[1] = 'M';
-	clipWriteLe32(bmp_header + 2, (uint32_t)(bmp_header_len + len));
-	clipWriteLe32(bmp_header + 10, (uint32_t)(bmp_header_len + dib_size));
 
 	if (pipe2(bmp_pipe, O_CLOEXEC) == -1 || pipe2(png_pipe, O_CLOEXEC) == -1) {
 		logPErr("image clipboard pipe");
@@ -396,15 +351,13 @@ bool clipWlCopyBitmap(enum uSynergyClipboardId id, const unsigned char *data, si
 	close(png_pipe[1]);
 	png_pipe[1] = -1;
 
-	if (!write_full(bmp_pipe[1], bmp_header, sizeof(bmp_header), 0) ||
-	    (normalize_truncated_v5 &&
-	     (!write_full(bmp_pipe[1], normalized_dib_header, sizeof(normalized_dib_header), 0) ||
-	      !write_full(bmp_pipe[1], data + 40, len - 40, 0))) ||
-	    (!normalize_truncated_v5 && !write_full(bmp_pipe[1], data, len, 0))) {
+	if (!write_full(bmp_pipe[1], bmp, bmp_len, 0)) {
 		logPErr("writing bitmap to ImageMagick");
 		goto done;
 	}
-	logInfo("Placed remote %dx%d image on Wayland clipboard", width, height < 0 ? -height : height);
+	haveRemoteBitmap[id] = clipBitmapHash(data, len, &remoteBitmapHash[id]);
+	logInfo("Queued remote %ux%u image on Wayland clipboard%s", bitmap.width, bitmap.height,
+		bitmap.repaired_legacy_header ? " (normalized legacy bitmap header)" : "");
 	ok = true;
 
 done:
@@ -418,5 +371,6 @@ done:
 		posix_spawn_file_actions_destroy(&magick_actions);
 	if (copy_actions_ready)
 		posix_spawn_file_actions_destroy(&copy_actions);
+	free(bmp);
 	return ok;
 }

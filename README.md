@@ -15,29 +15,40 @@ a bit of paranoia).
 (on an experimental basis) KDE, or (if all else fails) the willingness to run
 questionable networking utilities with the privileges to access /dev/uinput
 * [wl-clipboard](https://github.com/bugaevc/wl-clipboard) for clipboard support (*only works on wlroots, not KDE/GNOME*)
-* ImageMagick (`magick`) for image clipboard conversion in both directions
+* ImageMagick (`magick`), optionally, for image clipboard conversion in both directions
 
 ### Image clipboard support
 
-Images can be copied from the Wayland clipboard to a macOS Deskflow/Synergy
-server, as well as from the server to Wayland. Copy an image or screenshot on
-Linux, move the shared pointer back to the Mac, and paste into an application
-that accepts images. Clipboard contents are transferred, rather than files
-copied in a file manager.
+Images can be copied between the Wayland clipboard and a compatible Synergy,
+Barrier or Deskflow server. Copy an image or screenshot, move the shared pointer
+to the other computer, and paste into an application that accepts images.
+Clipboard contents are transferred, rather than files copied in a file manager.
 
 Install `waynergy-clip-update` with the Waynergy executable. On Linux, the
 helper beside the executable takes precedence over helpers on `PATH`, so a
 system helper from an older package cannot silently disable image sending.
-Otherwise the helper is found through `PATH`. PNG, JPEG and other image types supported by
-ImageMagick are converted to an uncompressed 24-bit DIB for the wire protocol;
-the conversion drops transparency. Incoming image echoes are compared by pixel
-content to avoid synchronization loops.
+Otherwise the helper is found through `PATH`. PNG, JPEG and other image types
+supported by ImageMagick are converted to an uncompressed 24-bit DIB for the
+wire protocol; outgoing conversion drops transparency. Incoming images retain
+explicit alpha masks. A shared parser handles 24/32-bit BI_RGB and 32-bit
+masked DIBs, including extended headers and both row orientations. Indexed,
+16-bit and compressed DIBs are rejected. Incoming image echoes are compared by
+pixel content to avoid synchronization loops.
+
+Image synchronization defaults to enabled when `magick` is available. If it is
+absent at startup, text synchronization continues. Set `images = false` in the
+`[clipboard]` section of `config.ini` to explicitly select text-only operation.
+For mixed image/text offers, a failed image conversion falls back to text.
 
 The outgoing bitmap format ID defaults to `2`, matching Barrier, Deskflow and
 modern Synergy. If a legacy server expects `1`, set `bitmap_format = 1` in the
 `[clipboard]` section of `config.ini`. Text copying continues to use format `0`.
 
 Run the clipboard conversion and protocol tests with `meson test -C build`.
+Automated fixtures cover standard Windows-style DIBs and the exact malformed
+V5 payload produced by older macOS converters. Manual copy/paste has been
+verified with a macOS server and an Omarchy/Hyprland client; Windows and other
+server/compositor combinations have not been manually verified.
 
 ### Building/Installation
 

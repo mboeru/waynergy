@@ -26,7 +26,12 @@ with tempfile.TemporaryDirectory(prefix='waynergy-clipboard-test-') as folder:
     root = Path(folder)
     # Isolate tests from the user's clipboard; the real converter is still used.
     mock = root / 'wl-paste'
-    mock.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_TYPES"\n')
+    mock.write_text('''#!/bin/sh
+case "$*" in
+  *--list-types*) printf "%s\\n" "$TEST_TYPES" ;;
+  *) test -n "$TEST_IMAGE" && /bin/cat "$TEST_IMAGE" ;;
+esac
+''')
     mock.chmod(0o755)
     env = dict(os.environ, PATH=folder + ':' + os.environ['PATH'],
                CLIPBOARD_STATE='data', TEST_TYPES='text/plain')
@@ -36,8 +41,8 @@ with tempfile.TemporaryDirectory(prefix='waynergy-clipboard-test-') as folder:
     server.listen()
     server.settimeout(20)
 
-    def transfer(data, bitmap=True, cid='c'):
-        args = [helper, cid, address] + (['bitmap'] if bitmap else [])
+    def transfer(data, bitmap=True, cid='c', text_only=False):
+        args = [helper, cid, address] + (['bitmap'] if bitmap else ['text-only'] if text_only else [])
         with tempfile.TemporaryFile() as source:
             source.write(data)
             source.seek(0)
@@ -74,12 +79,27 @@ with tempfile.TemporaryDirectory(prefix='waynergy-clipboard-test-') as folder:
     cid, dib = transfer(jpeg, cid='p')
     assert cid == b'P' and struct.unpack('<ii', dib[4:12]) == (17, 9)
     assert transfer(b'plain text', bitmap=False) == (b'c', b'plain text')
-    # Mixed offers prefer the image; clear/sensitive offers and malformed images
-    # must not send socket notifications or grab the remote clipboard.
+    # Mixed offers produce the same bitmap through either watcher; if the image
+    # is invalid, unavailable or cannot be converted, retain the fallback text.
     env['TEST_TYPES'] = 'text/plain\nimage/png'
-    assert subprocess.run([helper, 'c', address], input=b'fallback', env=env).returncode == 0
-    env['CLIPBOARD_STATE'] = 'nil'
-    assert subprocess.run([helper, 'c', address, 'bitmap'], input=b'', env=env).returncode == 0
+    fixture = root / 'mixed.png'
+    fixture.write_bytes(png(3, 2)[0])
+    env['TEST_IMAGE'] = str(fixture)
+    assert transfer(b'fallback', bitmap=False) == transfer(fixture.read_bytes())
+    assert transfer(b'fallback', bitmap=False, text_only=True) == (b'c', b'fallback')
+    fixture.write_bytes(b'broken image')
+    assert transfer(b'fallback', bitmap=False) == (b'c', b'fallback')
+    env['TEST_IMAGE'] = str(root / 'missing-image')
+    assert transfer(b'fallback', bitmap=False) == (b'c', b'fallback')
+    fixture.write_bytes(png(3, 2)[0])
+    env['TEST_IMAGE'] = str(fixture)
+    full_path = env['PATH']
+    env['PATH'] = folder  # wl-paste mock exists; ImageMagick is absent.
+    assert transfer(b'fallback', bitmap=False) == (b'c', b'fallback')
+    env['PATH'] = full_path
+    for state in ('nil', 'clear', 'sensitive'):
+        env['CLIPBOARD_STATE'] = state
+        assert subprocess.run([helper, 'c', address, 'bitmap'], input=b'', env=env).returncode == 0
     env['CLIPBOARD_STATE'] = 'data'
     assert subprocess.run([helper, 'c', address, 'bitmap'], input=b'invalid image', env=env,
                           stderr=subprocess.DEVNULL).returncode != 0
@@ -91,4 +111,4 @@ with tempfile.TemporaryDirectory(prefix='waynergy-clipboard-test-') as folder:
     except TimeoutError:
         pass
     server.close()
-print('PNG/JPEG conversion, large images, text and mixed offers passed')
+print('PNG/JPEG, large images, mixed offers and text-only/conversion-failure fallback passed')

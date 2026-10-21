@@ -14,6 +14,7 @@ src_c = files(
   'src/wl_input_uinput.c',
   'src/main.c',
   'src/clip.c',
+  'src/clip-bitmap.c',
   'src/config.c',
   'src/net.c',
   'src/os.c',
@@ -56,19 +57,25 @@ executable(
 clip_helper = executable(
   'waynergy-clip-update', 
   'src/clip-update.c', 
+  'src/clip-bitmap.c',
   install: true,
   include_directories: [include_directories('include')],
 )
 clipboard_test = executable('clipboard-test',
-  'test/clipboard.c', 'src/ssp.c', 'src/log.c',
+  'test/clipboard.c', 'src/ssp.c', 'src/log.c', 'src/clip-bitmap.c',
   dependencies: [client_protos, wayland_client, xkbcommon],
   c_args: ['-DWAYNERGY_TEST', '-UNDEBUG'],
   include_directories: include_directories('include'))
 test('clipboard-protocol', clipboard_test)
+bitmap_converter = executable('bitmap-convert-test',
+  'test/bitmap-convert.c', 'src/clip-bitmap.c',
+  include_directories: include_directories('include'))
 python = find_program('python3', required: false)
 if python.found() and find_program('magick', required: false).found()
   test('clipboard-helper', python,
     args: [files('test/clipboard-helper.py'), clip_helper], timeout: 60)
+  test('clipboard-bitmaps', python,
+    args: [files('test/bitmap.py'), bitmap_converter], timeout: 60)
 endif
 executable(
   'waynergy-mapper',

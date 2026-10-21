@@ -14,6 +14,7 @@
 #include "wayland.h"
 #include "config.h"
 #include "clip.h"
+#include "clip-bitmap.h"
 #include "log.h"
 #include "sig.h"
 #include "ver.h"
@@ -73,10 +74,7 @@ static void syn_key_cb(uSynergyCookie cookie, uint16_t key, uint16_t id, uint16_
 }
 static void syn_clip_cb(uSynergyCookie cookie, enum uSynergyClipboardId id, uint32_t format, const uint8_t *data, uint32_t size)
 {
-	uint32_t dib_header_size = 0;
-	if (size >= 4)
-		dib_header_size = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
-		                  ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+	struct clipBitmap bitmap;
 	logDbg("Received clipboard %u format %u: %u bytes", id, format, size);
 	switch (format) {
 	case USYNERGY_CLIPBOARD_FORMAT_TEXT:
@@ -85,9 +83,8 @@ static void syn_clip_cb(uSynergyCookie cookie, enum uSynergyClipboardId id, uint
 	case USYNERGY_CLIPBOARD_FORMAT_BITMAP:
 	case USYNERGY_CLIPBOARD_FORMAT_HTML:
 		/* Synergy/Deskflow versions differ in the ordering of HTML and
-		 * bitmap slots (1 and 2). A valid Synergy DIB begins with its
-		 * 40-byte INFOHEADER size; validate the rest in the image handler. */
-		if (dib_header_size == 40 || dib_header_size == 108 || dib_header_size == 124) {
+		 * bitmap slots (1 and 2). Only accept a fully validated DIB. */
+		if (clipBitmapParse(data, size, &bitmap)) {
 			clipWlCopyBitmap(id, data, size);
 		} else {
 			logDbg("Ignoring non-bitmap clipboard format %u (%u bytes)", format, size);
