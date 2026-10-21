@@ -35,5 +35,7 @@ enum uSynergyClipboardId clipIdFromFd(int fd);
 void clipMonitorPollProc(struct pollfd *pfd);
 /* run wl-copy, with given data */
 bool clipWlCopy(enum uSynergyClipboardId id, const unsigned char *data, size_t len);
+/* convert a Synergy bitmap (headerless BMP/DIB) to PNG and set it */
+bool clipWlCopyBitmap(enum uSynergyClipboardId id, const unsigned char *data, size_t len);
 /* write all of stdin to the clipboard monitor FIFO */
 int clipWriteToSocket(char *path, char cid);

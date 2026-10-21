@@ -620,25 +620,49 @@ static void sProcessMessage(uSynergyContext *context, struct sspBuf *msg)
 		      sspNetU32(msg, &len))) {
 			PARSE_ERROR();
 		}
-		if (mark ==  SYN_DATA_START) {
+		if (id > SYNERGY_CLIPBOARD_SELECTION) {
+			logErr("Invalid clipboard ID: %u", id);
+			return;
+		}
+		if (mark == SYN_DATA_START) {
+			char expected_len[21];
+			char *endptr;
+			unsigned long long parsed_len;
+			if (len == 0 || len >= sizeof(expected_len) || !sspMemMove(expected_len, msg, len)) {
+				logErr("Invalid clipboard stream length header");
+				return;
+			}
+			expected_len[len] = '\0';
+			errno = 0;
+			parsed_len = strtoull(expected_len, &endptr, 10);
+			if (errno || *endptr != '\0' || parsed_len == 0 || parsed_len > USYNERGY_MAX_CLIPBOARD_SIZE) {
+				logErr("Invalid clipboard stream size: %s", expected_len);
+				return;
+			}
 			context->m_clipGrabbed[id] = false;
 			context->m_clipInStream[id] = true;
 			context->m_clipPos[id] = 0;
-			char expected_len[len + 1];
-			sspMemMove(expected_len, msg, len);
-			expected_len[len] = '\0';
-			context->m_clipPosExpect[id] = atoi(expected_len);
+			context->m_clipPosExpect[id] = (size_t)parsed_len;
 			if (context->m_clipPosExpect[id] > context->m_clipLen[id]) {
 				context->m_clipBuf[id] = xrealloc(context->m_clipBuf[id], context->m_clipPosExpect[id]);
+				context->m_clipLen[id] = context->m_clipPosExpect[id];
 			}
 		} else if (mark == SYN_DATA_CHUNK && context->m_clipInStream[id]) {
-			if ((context->m_clipPos[id] + len) > context->m_clipPosExpect[id]) {
+			if (len > context->m_clipPosExpect[id] - context->m_clipPos[id]) {
 				logErr("Packet too long!");
 				return;
 			}
-			sspMemMove(context->m_clipBuf[id] + context->m_clipPos[id], msg, len);
+			if (!sspMemMove(context->m_clipBuf[id] + context->m_clipPos[id], msg, len)) {
+				PARSE_ERROR();
+			}
 			context->m_clipPos[id] += len;
-		} else if (mark ==  SYN_DATA_END && context->m_clipInStream[id]) {
+		} else if (mark == SYN_DATA_END && context->m_clipInStream[id]) {
+			if (context->m_clipPos[id] != context->m_clipPosExpect[id]) {
+				logErr("Incomplete clipboard stream: expected %zu bytes, received %zu",
+				       context->m_clipPosExpect[id], context->m_clipPos[id]);
+				context->m_clipInStream[id] = false;
+				return;
+			}
 			struct sspBuf clipmsg = {
 				.data = context->m_clipBuf[id],
 				.pos = 0,
@@ -783,7 +807,7 @@ static void sUpdateContext(uSynergyContext *context)
 	}
 
 	/* Throw away over-sized packets */
-	if (packlen > USYNERGY_RECEIVE_BUFFER_SIZE)
+	if (packlen > USYNERGY_MAX_PACKET_SIZE)
 	{
 		/* Oversized packet, ditch tail end */
 		logWarn("Oversized packet: '%c%c%c%c' (length %d)", context->m_receiveBuffer[4], context->m_receiveBuffer[5], context->m_receiveBuffer[6], context->m_receiveBuffer[7], packlen);

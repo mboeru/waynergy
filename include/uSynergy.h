@@ -104,7 +104,9 @@ enum uSynergyClipboardFormat
 
 #define				USYNERGY_TRACE_BUFFER_SIZE		1024			/* Maximum length of traced message */
 #define				USYNERGY_REPLY_BUFFER_SIZE		1024			/* Maximum size of a reply packet */
-#define				USYNERGY_RECEIVE_BUFFER_SIZE	0xFFFF			/* Maximum size of an incoming packet */
+#define				USYNERGY_MAX_PACKET_SIZE	(1024 * 1024)		/* Maximum payload size of an incoming packet */
+#define				USYNERGY_RECEIVE_BUFFER_SIZE	(USYNERGY_MAX_PACKET_SIZE + 4)	/* Packet payload plus its uint32 length */
+#define				USYNERGY_MAX_CLIPBOARD_SIZE	(128 * 1024 * 1024)	/* Bound streamed clipboard allocation */
 
 
 

@@ -73,9 +73,29 @@ static void syn_key_cb(uSynergyCookie cookie, uint16_t key, uint16_t id, uint16_
 }
 static void syn_clip_cb(uSynergyCookie cookie, enum uSynergyClipboardId id, uint32_t format, const uint8_t *data, uint32_t size)
 {
-	//XXX: Only text makes any sense to process here.
-	if (format == 0) {
+	uint32_t dib_header_size = 0;
+	if (size >= 4)
+		dib_header_size = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+		                  ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+	logDbg("Received clipboard %u format %u: %u bytes", id, format, size);
+	switch (format) {
+	case USYNERGY_CLIPBOARD_FORMAT_TEXT:
 		clipWlCopy(id, data, size);
+		break;
+	case USYNERGY_CLIPBOARD_FORMAT_BITMAP:
+	case USYNERGY_CLIPBOARD_FORMAT_HTML:
+		/* Synergy/Deskflow versions differ in the ordering of HTML and
+		 * bitmap slots (1 and 2). A valid Synergy DIB begins with its
+		 * 40-byte INFOHEADER size; validate the rest in the image handler. */
+		if (dib_header_size == 40 || dib_header_size == 108 || dib_header_size == 124) {
+			clipWlCopyBitmap(id, data, size);
+		} else {
+			logDbg("Ignoring non-bitmap clipboard format %u (%u bytes)", format, size);
+		}
+		break;
+	default:
+		logDbg("Ignoring unsupported clipboard format %u", format);
+		break;
 	}
 }
 static void syn_screensaver_cb(uSynergyCookie cookie, bool state)
@@ -335,7 +355,3 @@ done:
 	free(backend);
 	return ret;
 }
-
-
-
-
