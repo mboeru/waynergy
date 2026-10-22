@@ -137,6 +137,8 @@ static void sSetDisconnected(uSynergyContext *context, enum uSynergyError err)
 	context->m_receiveOfs = 0;
 	context->m_replyCur			= context->m_replyBuffer + 4;
 	context->m_sequenceNumber	= 0;
+	context->m_clipboardSharingEnabled = true;
+	context->m_clipboardMaxBytes = USYNERGY_MAX_CLIPBOARD_SIZE;
 	context->m_lastError = err;
 }
 
@@ -233,11 +235,32 @@ static void sSendJoystickCallback(uSynergyContext *context, uint8_t joyNum)
 	context->m_joystickCallback(context->m_cookie, joyNum, context->m_joystickButtons[joyNum], sticks[0], sticks[1], sticks[2], sticks[3]);
 }
 
+/* Compare the marshalled DIB size, not the compressed PNG/JPEG size, with
+ * the limit advertised by the server (CLSZ is expressed in KiB). */
+static bool sClipboardAllowed(uSynergyContext *context, size_t len)
+{
+	if (!context->m_clipboardSharingEnabled || !context->m_clipboardMaxBytes) {
+		logWarn("Not sending clipboard: sharing is disabled by the server");
+		return false;
+	}
+	if (len > context->m_clipboardMaxBytes) {
+		logWarn("Not sending clipboard: %zu bytes exceeds server limit of %" PRIu64
+			" bytes; increase the maximum shared clipboard size on the server", len,
+			context->m_clipboardMaxBytes);
+		return false;
+	}
+	return true;
+}
+
 /**
 @brief Send clipboard data
 **/
 void uSynergySendClipboard(uSynergyContext *context, int id, uint32_t len, const unsigned char *text)
 {
+	if (!sClipboardAllowed(context, len)) {
+		context->m_clipPos[id] = 0;
+		return;
+	}
 	char buffer[128];
 	int pos;
 	uint32_t chunk_len;
@@ -263,7 +286,10 @@ void uSynergySendClipboard(uSynergyContext *context, int id, uint32_t len, const
 	      sAddString(context, buffer))) {
 		REPLY_ERROR();
 	}
-	sSendReply(context);
+	if (!sSendReply(context)) {
+		logErr("Clipboard stream write failed");
+		return;
+	}
 	// Now we do the chunks.
 	for (pos = 0; pos < len; pos += chunk_len) {
 		chunk_len = ((len - pos) > max_length) ? max_length : len - pos;
@@ -276,7 +302,10 @@ void uSynergySendClipboard(uSynergyContext *context, int id, uint32_t len, const
 		      sAddBin(context, chunk, chunk_len))) {
 			REPLY_ERROR();
 		}
-		sSendReply(context);
+		if (!sSendReply(context)) {
+			logErr("Clipboard stream write failed");
+			return;
+		}
 	}
 	//And then we're done
 	if (!(sAddString(context, "DCLP") &&
@@ -286,7 +315,11 @@ void uSynergySendClipboard(uSynergyContext *context, int id, uint32_t len, const
 	      sAddUInt32(context, 0))) {
 		REPLY_ERROR();
 	}
-	sSendReply(context);
+	if (!sSendReply(context)) {
+		logErr("Clipboard stream write failed");
+		return;
+	}
+	logInfo("Sent clipboard %d to server: %u bytes", id, len);
 }
 
 
@@ -391,8 +424,8 @@ static void sProcessMessage(uSynergyContext *context, struct sspBuf *msg)
 	}
 	else if (!strcmp(pkt_id, "CROP"))
 	{
-		// Do nothing?
-		//		kMsgCResetOptions	= "CROP"
+		context->m_clipboardSharingEnabled = true;
+		context->m_clipboardMaxBytes = USYNERGY_MAX_CLIPBOARD_SIZE;
 		return;
 	}
 	else if (!strcmp(pkt_id, "CINN"))
@@ -565,8 +598,20 @@ static void sProcessMessage(uSynergyContext *context, struct sspBuf *msg)
 	}
 	else if (!strcmp(pkt_id, "DSOP"))
 	{
-		// Set options
-		//		kMsgDSetOptions		= "DSOP%4I"
+		uint32_t count, option, value;
+		if (!sspNetU32(msg, &count) || count % 2 || count > (msg->len - msg->pos) / 4)
+			PARSE_ERROR();
+		for (uint32_t i = 0; i < count; i += 2) {
+			if (!sspNetU32(msg, &option) || !sspNetU32(msg, &value))
+				PARSE_ERROR();
+			if (option == USYNERGY_OPTION_CLIPBOARD_SHARING) {
+				context->m_clipboardSharingEnabled = value != 0;
+				logInfo("Server clipboard sharing: %s", value ? "enabled" : "disabled");
+			} else if (option == USYNERGY_OPTION_CLIPBOARD_SIZE && value <= INT32_MAX) {
+				context->m_clipboardMaxBytes = (uint64_t)value * 1024;
+				logInfo("Server clipboard size limit: %u KiB", value);
+			}
+		}
 	}
 	else if (!strcmp(pkt_id, "CALV"))
 	{
@@ -926,14 +971,16 @@ void uSynergyUpdateClipBuf(uSynergyContext *context, enum uSynergyClipboardId id
 }
 
 /* Update clipboard buffer from local text or bitmap data. */
-void uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboardId id,
+bool uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboardId id,
 	uint32_t format, uint32_t len, const unsigned char *data)
 {
 	if ((id != SYNERGY_CLIPBOARD_CLIPBOARD && id != SYNERGY_CLIPBOARD_SELECTION) ||
 		!data || len > USYNERGY_MAX_CLIPBOARD_SIZE - 12)
-		return;
+		return false;
+	if (!sClipboardAllowed(context, (size_t)len + 12))
+		return false;
 	if (uSynergyClipBufContains(context, id, format, len, data))
-		return;
+		return false;
 	context->m_clipInStream[id] = false;
 	context->m_clipGrabbed[id] = true;
 	context->m_clipPos[id] = (size_t)len + 12;
@@ -947,19 +994,22 @@ void uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboar
 	buf = buf_add_int32(buf, len);
 	memmove(buf, data, len);
 	if (!context->m_connected || !context->m_hasReceivedHello)
-		return;
+		return true;
 	if (!(sAddString(context, "CCLP") &&
 		  sAddUInt8(context, id) &&
 		  sAddUInt32(context, context->m_sequenceNumber))) {
-		REPLY_ERROR();
+		logErr("Could not construct clipboard grab");
+		return false;
 	}
-	sSendReply(context);
+	if (!sSendReply(context))
+		return false;
 	/* Conversion may finish just after COUT. Do not wait for another screen
 	 * transition to send that image to the now-active server. */
 	if (!context->m_isCaptured) {
 		uSynergySendClipboard(context, id, context->m_clipPos[id], context->m_clipBuf[id]);
 		context->m_clipGrabbed[id] = false;
 	}
+	return true;
 }
 
 /* Update resolution */

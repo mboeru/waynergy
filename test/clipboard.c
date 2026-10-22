@@ -86,9 +86,77 @@ static void hash_tests(void)
 	assert(!clipBitmapHash(a, sizeof(a), &bh));
 }
 
+static unsigned limit_grabs;
+static bool limit_packet(uSynergyCookie cookie, const unsigned char *data, int len)
+{
+	if (len >= 8 && !memcmp(data + 4, "CCLP", 4))
+		++limit_grabs;
+	return true;
+}
+
+static void set_clipboard_option(uSynergyContext *context, uint32_t option, uint32_t value)
+{
+	unsigned char packet[16] = {'D','S','O','P'};
+	buf_add_int32(packet + 4, 2);
+	buf_add_int32(packet + 8, option);
+	buf_add_int32(packet + 12, value);
+	struct sspBuf message = {.data = packet, .len = sizeof(packet)};
+	sProcessMessage(context, &message);
+}
+
+static void server_limit_tests(void)
+{
+	uSynergyContext *context = calloc(1, sizeof(*context));
+	uSynergyInit(context);
+	context->m_connected = context->m_hasReceivedHello = context->m_isCaptured = true;
+	context->m_sendFunc = limit_packet;
+	size_t len = 6 * 1024 * 1024;
+	unsigned char *image = calloc(1, len);
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SIZE, 3072);
+	assert(context->m_clipboardMaxBytes == 3 * 1024 * 1024);
+	/* The failing real-world case: a PNG can be small on disk, while its
+	 * marshalled bitmap exceeds the Mac server's 3 MiB limit. Do not grab
+	 * (and clear) the remote clipboard for an image the server will reject. */
+	assert(!uSynergyUpdateClipBufFormat(context, 0, 2, len, image));
+	assert(!limit_grabs && !context->m_clipBuf[0]);
+	assert(uSynergyUpdateClipBufFormat(context, 0, 2, 1024, image));
+	assert(limit_grabs == 1);
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SIZE, 32768);
+	assert(uSynergyUpdateClipBufFormat(context, 0, 2, len, image));
+	assert(limit_grabs == 2); /* The previously rejected image can be retried. */
+	/* Recheck limits if they change while an image waits for COUT. */
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SIZE, 3072);
+	struct sspBuf leave = {.data = (const unsigned char *)"COUT", .len = 4};
+	sProcessMessage(context, &leave);
+	assert(!context->m_clipGrabbed[0] && !context->m_clipPos[0]);
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SHARING, 0);
+	assert(!uSynergyUpdateClipBufFormat(context, 0, 0, 4, image));
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SHARING, 1);
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SIZE, 0);
+	assert(!uSynergyUpdateClipBufFormat(context, 0, 0, 4, image));
+	set_clipboard_option(context, USYNERGY_OPTION_CLIPBOARD_SIZE, UINT32_MAX);
+	assert(!context->m_clipboardMaxBytes); /* Ignore negative option values. */
+	struct sspBuf reset = {.data = (const unsigned char *)"CROP", .len = 4};
+	sProcessMessage(context, &reset);
+	assert(context->m_clipboardSharingEnabled &&
+		context->m_clipboardMaxBytes == USYNERGY_MAX_CLIPBOARD_SIZE);
+	unsigned char malformed[] = {'D','S','O','P',0,0,0,2, 'C','L','S','Z'};
+	struct sspBuf bad = {.data = malformed, .len = sizeof(malformed)};
+	sProcessMessage(context, &bad);
+	assert(context->m_clipboardMaxBytes == USYNERGY_MAX_CLIPBOARD_SIZE);
+	context->m_isCaptured = true;
+	context->m_clipboardMaxBytes = 16;
+	assert(uSynergyUpdateClipBufFormat(context, 0, 0, 4, image));
+	assert(!uSynergyUpdateClipBufFormat(context, 0, 0, 5, image));
+	free(context->m_clipBuf[0]);
+	free(context);
+	free(image);
+}
+
 int main(void)
 {
 	hash_tests();
+	server_limit_tests();
 	uSynergyContext *context = calloc(1, sizeof(*context));
 	uSynergyInit(context);
 	peer_context = calloc(1, sizeof(*peer_context));

@@ -223,8 +223,8 @@ void clipMonitorPollProc(struct pollfd *pfd)
 					format = 2;
 				}
 				haveRemoteBitmap[id] = false;
-				uSynergyUpdateClipBufFormat(&synContext, id, format, len, (unsigned char *)buf);
-				logInfo("Queued local image for remote clipboard: %zu bytes, format %ld", len, format);
+				if (uSynergyUpdateClipBufFormat(&synContext, id, format, len, (unsigned char *)buf))
+					logInfo("Accepted local image for remote clipboard: %zu bytes, format %ld", len, format);
 			} else {
 				haveRemoteBitmap[id] = false;
 				uSynergyUpdateClipBuf(&synContext, id, len, buf);

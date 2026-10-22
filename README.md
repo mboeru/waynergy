@@ -40,6 +40,14 @@ absent at startup, text synchronization continues. Set `images = false` in the
 `[clipboard]` section of `config.ini` to explicitly select text-only operation.
 For mixed image/text offers, a failed image conversion falls back to text.
 
+The server can impose a maximum shared clipboard size. This limit applies to
+the uncompressed DIB plus protocol metadata, so even a small PNG can exceed it.
+Waynergy reads the server's advertised limit and logs a warning instead of
+grabbing the remote clipboard for data that cannot be transferred. If a large
+screenshot is rejected, increase the maximum clipboard size in the server's
+settings, then copy the image again. Images are not resized or recompressed to
+fit the limit.
+
 The outgoing bitmap format ID defaults to `2`, matching Barrier, Deskflow and
 modern Synergy. If a legacy server expects `1`, set `bitmap_format = 1` in the
 `[clipboard]` section of `config.ini`. Text copying continues to use format `0`.

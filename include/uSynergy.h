@@ -107,6 +107,9 @@ enum uSynergyClipboardFormat
 #define				USYNERGY_MAX_PACKET_SIZE	(1024 * 1024)		/* Maximum payload size of an incoming packet */
 #define				USYNERGY_RECEIVE_BUFFER_SIZE	(USYNERGY_MAX_PACKET_SIZE + 4)	/* Packet payload plus its uint32 length */
 #define				USYNERGY_MAX_CLIPBOARD_SIZE	(128 * 1024 * 1024)	/* Bound streamed clipboard allocation */
+#define USYNERGY_OPTION_CLIPBOARD_SHARING UINT32_C(0x434c5053) /* CLPS */
+#define USYNERGY_OPTION_CLIPBOARD_SIZE UINT32_C(0x434c535a) /* CLSZ, KiB */
+
 
 
 
@@ -361,6 +364,8 @@ typedef struct uSynergyContext
 	bool					m_isCaptured;									/* Is Synergy active (i.e. this client is receiving input messages?) */
 	uint32_t						m_lastMessageTime;								/* Time at which last message was received */
 	uint32_t						m_sequenceNumber;								/* Packet sequence number */
+	bool m_clipboardSharingEnabled;
+	uint64_t m_clipboardMaxBytes; /* Server limit, including format metadata. */
 	uint8_t							m_receiveBuffer[USYNERGY_RECEIVE_BUFFER_SIZE];	/* Receive buffer */
 	int								m_receiveOfs;									/* Receive buffer offset */
 	uint8_t							m_replyBuffer[USYNERGY_REPLY_BUFFER_SIZE];		/* Reply buffer */
@@ -431,7 +436,7 @@ accepts bitmap DIB data; its format ID must match the remote implementation.
 @param text		Text to set to the clipboard
 **/
 extern void 		uSynergyUpdateClipBuf(uSynergyContext *context, enum uSynergyClipboardId id, uint32_t len, const char *data);
-extern void uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboardId id,
+extern bool uSynergyUpdateClipBufFormat(uSynergyContext *context, enum uSynergyClipboardId id,
 	uint32_t format, uint32_t len, const unsigned char *data);
 
 /**
